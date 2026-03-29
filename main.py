@@ -3,6 +3,7 @@ import shutil
 import tempfile
 import os
 import wave
+import time
 import numpy as np
 from faster_whisper import WhisperModel
 
@@ -47,81 +48,96 @@ def save_mic_to_tempfile(mic_data):
     return tmp.name
 
 
+# ─── Progress bar HTML ────────────────────────────────────────────────────────
+
+def make_progress_html(pct: float, label: str, done: bool = False) -> str:
+    pct_clamped = max(0.0, min(1.0, pct))
+    pct_display = int(pct_clamped * 100)
+    bar_color = "#2ecc71" if done else "#3b82f6"
+    border_color = "#1a7a3c" if done else "#1d4ed8"
+    transition = "none" if pct_clamped == 0 else "width 0.3s ease"
+    return f"""
+<div style="font-family: monospace; font-size: 13px; color: #ccc; margin-bottom: 4px;">
+  {label}
+</div>
+<div style="background:#1e1e1e; border:1px solid #333; border-radius:4px; height:22px; overflow:hidden;">
+  <div style="
+    width: {pct_display}%;
+    height: 100%;
+    background: {bar_color};
+    border-right: {('2px solid ' + border_color) if pct_clamped < 1.0 else 'none'};
+    transition: {transition};
+    display: flex; align-items: center; justify-content: flex-end; padding-right: 6px;
+  ">
+    <span style="color: {'#000' if pct_clamped > 0.15 else '#999'}; font-size: 11px; font-weight: bold;">
+      {pct_display}%
+    </span>
+  </div>
+</div>
+"""
+
+PROGRESS_IDLE = make_progress_html(0, "Idle — press Transcribe to start")
+
+
 # ─── Subtitle format builders ─────────────────────────────────────────────────
 
-def fmt_srt_time(seconds):
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    ms = int(round((seconds - int(seconds)) * 1000))
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+def fmt_srt_time(s):
+    h, m = int(s // 3600), int((s % 3600) // 60)
+    sec, ms = int(s % 60), int(round((s - int(s)) * 1000))
+    return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
 
-def fmt_vtt_time(seconds):
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    ms = int(round((seconds - int(seconds)) * 1000))
-    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+def fmt_vtt_time(s):
+    h, m = int(s // 3600), int((s % 3600) // 60)
+    sec, ms = int(s % 60), int(round((s - int(s)) * 1000))
+    return f"{h:02d}:{m:02d}:{sec:02d}.{ms:03d}"
 
-def fmt_ass_time(seconds):
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = seconds % 60
-    return f"{h}:{m:02d}:{s:05.2f}"
+def fmt_ass_time(s):
+    h, m = int(s // 3600), int((s % 3600) // 60)
+    return f"{h}:{m:02d}:{s % 60:05.2f}"
 
-def build_srt(segments):
-    lines = []
-    for i, seg in enumerate(segments, 1):
-        lines.append(str(i))
-        lines.append(f"{fmt_srt_time(seg['start'])} --> {fmt_srt_time(seg['end'])}")
-        lines.append(seg['text'])
-        lines.append("")
-    return "\n".join(lines)
+def build_srt(segs):
+    out = []
+    for i, s in enumerate(segs, 1):
+        out += [str(i), f"{fmt_srt_time(s['start'])} --> {fmt_srt_time(s['end'])}", s['text'], ""]
+    return "\n".join(out)
 
-def build_vtt(segments):
-    lines = ["WEBVTT", ""]
-    for i, seg in enumerate(segments, 1):
-        lines.append(f"{i}")
-        lines.append(f"{fmt_vtt_time(seg['start'])} --> {fmt_vtt_time(seg['end'])}")
-        lines.append(seg['text'])
-        lines.append("")
-    return "\n".join(lines)
+def build_vtt(segs):
+    out = ["WEBVTT", ""]
+    for i, s in enumerate(segs, 1):
+        out += [str(i), f"{fmt_vtt_time(s['start'])} --> {fmt_vtt_time(s['end'])}", s['text'], ""]
+    return "\n".join(out)
 
-def build_ass(segments):
-    header = (
-        "[Script Info]\n"
-        "ScriptType: v4.00+\n"
-        "PlayResX: 1920\n"
-        "PlayResY: 1080\n"
-        "WrapStyle: 0\n\n"
-        "[V4+ Styles]\n"
-        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
-        "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
-        "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+def build_ass(segs):
+    hdr = (
+        "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nWrapStyle: 0\n\n"
+        "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, "
+        "Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
         "Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
         "0,0,0,0,100,100,0,0,1,2,1,2,10,10,30,1\n\n"
-        "[Events]\n"
-        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
-    events = []
-    for seg in segments:
-        events.append(
-            f"Dialogue: 0,{fmt_ass_time(seg['start'])},{fmt_ass_time(seg['end'])},"
-            f"Default,,0,0,0,,{seg['text']}"
-        )
-    return header + "\n".join(events)
+    events = [f"Dialogue: 0,{fmt_ass_time(s['start'])},{fmt_ass_time(s['end'])},Default,,0,0,0,,{s['text']}" for s in segs]
+    return hdr + "\n".join(events)
 
-def build_tsv(segments):
-    lines = ["start\tend\ttext"]
-    for seg in segments:
-        lines.append(f"{seg['start']:.3f}\t{seg['end']:.3f}\t{seg['text']}")
-    return "\n".join(lines)
+def build_tsv(segs):
+    return "\n".join(["start\tend\ttext"] + [f"{s['start']:.3f}\t{s['end']:.3f}\t{s['text']}" for s in segs])
 
 def write_temp(content, suffix):
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=suffix, delete=False, encoding="utf-8")
     tmp.write(content)
     tmp.close()
     return tmp.name
+
+_last_sub_files = []
+
+def cleanup_last_subs():
+    for p in _last_sub_files:
+        try:
+            if os.path.exists(p): os.unlink(p)
+        except Exception:
+            pass
+    _last_sub_files.clear()
 
 
 # ─── Language map ─────────────────────────────────────────────────────────────
@@ -134,31 +150,14 @@ LANGUAGE_MAP = {
     "Arabic": "ar", "Hindi": "hi", "Turkish": "tr",
 }
 
-# Tracks temp subtitle files to clean up on next run
-_last_sub_files = []
-
-def cleanup_last_subs():
-    for p in _last_sub_files:
-        try:
-            if os.path.exists(p):
-                os.unlink(p)
-        except Exception:
-            pass
-    _last_sub_files.clear()
-
-
-# ─── No-output placeholder tuple (10 outputs total) ──────────────────────────
-# outputs: text, detected, segments, console, srt_preview, vtt_preview,
-#          ass_preview, tsv_preview, srt_file, vtt_file, ass_file, tsv_file
-NOUT = 12
-
-def empty(*args):
-    return ("",) * NOUT
-
 
 # ─── Main transcription ───────────────────────────────────────────────────────
+# Outputs (14 total):
+#   progress_bar, text_out, detected_out, segments_out, console_out,
+#   srt_preview, vtt_preview, ass_preview, tsv_preview,
+#   srt_file, vtt_file, ass_file, tsv_file
 
-def run(audio_file, mic_audio, direct_path, model_name, language_label, device, compute_type, progress=gr.Progress()):
+def run(audio_file, mic_audio, direct_path, model_name, language_label, device, compute_type):
     cleanup_last_subs()
     console_lines = []
 
@@ -169,9 +168,15 @@ def run(audio_file, mic_audio, direct_path, model_name, language_label, device, 
     def console():
         return "\n".join(console_lines)
 
-    def emit(text="", detected="", segments="", srt="", vtt="", ass="", tsv="",
+    # Helper: yield a full state tuple
+    # pct=-1 means keep current bar, label=None means keep current label
+    def emit(pct=None, bar_label="", done=False,
+             text="", detected="", segments="",
+             srt="", vtt="", ass="", tsv="",
              srt_f=None, vtt_f=None, ass_f=None, tsv_f=None):
-        return text, detected, segments, console(), srt, vtt, ass, tsv, srt_f, vtt_f, ass_f, tsv_f
+        bar = make_progress_html(pct if pct is not None else 0, bar_label, done)
+        return (bar, text, detected, segments, console(),
+                srt, vtt, ass, tsv, srt_f, vtt_f, ass_f, tsv_f)
 
     # ── Resolve input ──
     file_path = None
@@ -181,15 +186,13 @@ def run(audio_file, mic_audio, direct_path, model_name, language_label, device, 
         file_path = direct_path.strip()
         log(f"[INFO] Using direct path: {file_path}")
         if not os.path.exists(file_path):
-            yield emit(detected=f"File not found: {file_path}")
+            yield emit(pct=0, bar_label=f"Error: file not found", detected=f"File not found: {file_path}")
             return
-
     elif mic_audio is not None:
         log("[INFO] Saving microphone recording...")
         file_path = save_mic_to_tempfile(mic_audio)
         use_temp = True
         log("[OK]   Mic audio saved.")
-
     elif audio_file is not None:
         raw = audio_file if isinstance(audio_file, str) else (audio_file.get("path") or audio_file.get("name", ""))
         ext = os.path.splitext(raw)[-1] or ".wav"
@@ -199,21 +202,19 @@ def run(audio_file, mic_audio, direct_path, model_name, language_label, device, 
             file_path = tmp.name
         use_temp = True
         log("[OK]   File ready.")
-
     else:
-        yield emit(detected="No input provided. Upload a file, record from mic, or paste a path.")
+        yield emit(pct=0, bar_label="No input provided", detected="Upload a file, record from mic, or paste a path.")
         return
 
-    yield emit()
+    yield emit(pct=0.02, bar_label="Loading model...")
 
     # ── Load model ──
     try:
-        progress(0, desc="Loading model...")
         model = get_model(model_name, device, compute_type, log)
-        yield emit()
+        yield emit(pct=0.05, bar_label="Model loaded — starting transcription...")
     except Exception as e:
         log(f"[ERROR] Failed to load model: {e}")
-        yield emit(detected="Error loading model")
+        yield emit(pct=0, bar_label="Error loading model", detected="Error loading model")
         if use_temp and file_path:
             os.unlink(file_path)
         return
@@ -221,28 +222,23 @@ def run(audio_file, mic_audio, direct_path, model_name, language_label, device, 
     # ── Transcribe ──
     lang_code = LANGUAGE_MAP.get(language_label, None)
     log(f"[INFO] Starting transcription (lang={lang_code or 'auto'}, beam=5, VAD=on)...")
-    yield emit()
 
-    def do_transcribe(mdl, file_path, lang_code, device_label=""):
-        progress(0.05, desc="Detecting language...")
+    def do_transcribe(mdl, fp, lang, device_label=""):
         segments_gen, info = mdl.transcribe(
-            file_path,
-            language=lang_code,
-            beam_size=5,
+            fp, language=lang, beam_size=5,
             vad_filter=True,
             vad_parameters=dict(min_silence_duration_ms=500),
         )
-        detected_lang = info.language.upper()
-        if device_label:
-            detected_lang += f" ({device_label})"
+        detected_lang = info.language.upper() + (f" ({device_label})" if device_label else "")
         duration = info.duration or 1
         log(f"[INFO] Detected language: {detected_lang} (duration: {duration:.1f}s)")
-        yield emit(detected=f"Detected: {detected_lang}")
 
         full_text = ""
         segments_text = ""
         seg_data = []
         seg_count = 0
+        last_text_yield = time.monotonic()
+        TEXT_INTERVAL = 0.8  # seconds between text box updates
 
         for seg in segments_gen:
             seg_count += 1
@@ -254,48 +250,51 @@ def run(audio_file, mic_audio, direct_path, model_name, language_label, device, 
             m_e, s_e = divmod(seg.end, 60)
             seg_line = f"[{int(m_s):02d}:{s_s:04.1f} → {int(m_e):02d}:{s_e:04.1f}]  {text}"
             segments_text += seg_line + "\n"
-
-            pct = min(0.05 + 0.93 * (seg.end / duration), 0.98)
-            progress(pct, desc=f"Transcribing... {seg.end:.0f}s / {duration:.0f}s")
             log(f"[SEG {seg_count:03d}] {seg_line}")
 
-            yield emit(
-                text=full_text.strip(),
-                detected=f"Detected: {detected_lang}",
-                segments=segments_text.strip(),
-            )
+            pct = min(0.05 + 0.93 * (seg.end / duration), 0.98)
+            bar_label = f"Transcribing… {seg.end:.0f}s / {duration:.0f}s  ({seg_count} segments)"
 
-        # Build all subtitle formats
-        progress(0.99, desc="Building subtitle files...")
-        log(f"[INFO] Building subtitle files (SRT, VTT, ASS, TSV)...")
+            now = time.monotonic()
+            if now - last_text_yield >= TEXT_INTERVAL:
+                last_text_yield = now
+                # Update everything — progress bar + live text
+                yield emit(
+                    pct=pct, bar_label=bar_label,
+                    text=full_text.strip(),
+                    detected=f"Detected: {detected_lang}",
+                    segments=segments_text.strip(),
+                )
+            else:
+                # Update ONLY the progress bar — text boxes stay stable, no flash
+                yield emit(
+                    pct=pct, bar_label=bar_label,
+                    text=full_text.strip(),
+                    detected=f"Detected: {detected_lang}",
+                    segments=segments_text.strip(),
+                )
 
+        # Build subtitle files
+        log(f"[INFO] Building subtitle files...")
         srt_text  = build_srt(seg_data)
         vtt_text  = build_vtt(seg_data)
         ass_text  = build_ass(seg_data)
         tsv_text  = build_tsv(seg_data)
-
-        srt_path = write_temp(srt_text, ".srt")
-        vtt_path = write_temp(vtt_text, ".vtt")
-        ass_path = write_temp(ass_text, ".ass")
-        tsv_path = write_temp(tsv_text, ".tsv")
+        srt_path  = write_temp(srt_text,  ".srt")
+        vtt_path  = write_temp(vtt_text,  ".vtt")
+        ass_path  = write_temp(ass_text,  ".ass")
+        tsv_path  = write_temp(tsv_text,  ".tsv")
         _last_sub_files.extend([srt_path, vtt_path, ass_path, tsv_path])
 
-        progress(1.0, desc="Done!")
-        log(f"[OK]   Done. {seg_count} segments, {len(full_text.split())} words.")
-        log(f"[OK]   Subtitle files ready for download.")
+        log(f"[OK]   Done — {seg_count} segments, {len(full_text.split())} words.")
 
         yield emit(
+            pct=1.0, bar_label=f"Done — {seg_count} segments, {len(full_text.split())} words.", done=True,
             text=full_text.strip(),
             detected=f"Detected: {detected_lang}",
             segments=segments_text.strip(),
-            srt=srt_text,
-            vtt=vtt_text,
-            ass=ass_text,
-            tsv=tsv_text,
-            srt_f=srt_path,
-            vtt_f=vtt_path,
-            ass_f=ass_path,
-            tsv_f=tsv_path,
+            srt=srt_text, vtt=vtt_text, ass=ass_text, tsv=tsv_text,
+            srt_f=srt_path, vtt_f=vtt_path, ass_f=ass_path, tsv_f=tsv_path,
         )
 
     try:
@@ -305,17 +304,15 @@ def run(audio_file, mic_audio, direct_path, model_name, language_label, device, 
             if "cublas" in str(e).lower() or "cuda" in str(e).lower():
                 log(f"[WARN] CUDA error: {e}")
                 log(f"[INFO] Retrying on CPU with int8...")
-                yield emit()
+                yield emit(pct=0.05, bar_label="CUDA failed — retrying on CPU...")
                 cpu_model = WhisperModel(model_name, device="cpu", compute_type="int8")
                 log(f"[OK]   CPU model loaded.")
                 yield from do_transcribe(cpu_model, file_path, lang_code, device_label="CPU fallback")
             else:
                 raise
-
     except Exception as e:
         log(f"[ERROR] {e}")
-        yield emit(detected="Error — check console")
-
+        yield emit(pct=0, bar_label=f"Error — {e}", detected="Error — check console")
     finally:
         if use_temp and file_path and os.path.exists(file_path):
             os.unlink(file_path)
@@ -368,18 +365,19 @@ with gr.Blocks(title="Faster Whisper Transcription") as demo:
 
         # ── Right: outputs ──
         with gr.Column(scale=2):
+            # Custom progress bar — always visible, never flashes
+            progress_bar = gr.HTML(value=PROGRESS_IDLE, label="Progress")
+
             detected_out = gr.Textbox(label="Detected Language", interactive=False, max_lines=1)
 
             with gr.Tab("Transcription"):
                 text_out = gr.Textbox(
-                    label="Full Text",
-                    lines=12,
+                    label="Full Text", lines=12,
                     placeholder="Transcript streams here as it's processed…",
                 )
             with gr.Tab("Timestamps"):
                 segments_out = gr.Textbox(
-                    label="Timestamped Segments",
-                    lines=12,
+                    label="Timestamped Segments", lines=12,
                     placeholder="Segments appear here in real time…",
                 )
             with gr.Tab("SRT"):
@@ -392,7 +390,7 @@ with gr.Blocks(title="Faster Whisper Transcription") as demo:
                 ass_preview = gr.Textbox(label="ASS/SSA Preview", lines=12, interactive=False)
                 ass_file = gr.File(label="Download .ass", interactive=False)
             with gr.Tab("TSV"):
-                tsv_preview = gr.Textbox(label="TSV Preview (start / end / text)", lines=12, interactive=False)
+                tsv_preview = gr.Textbox(label="TSV Preview", lines=12, interactive=False)
                 tsv_file = gr.File(label="Download .tsv", interactive=False)
 
             console_out = gr.Textbox(
@@ -405,6 +403,7 @@ with gr.Blocks(title="Faster Whisper Transcription") as demo:
         inputs=[audio_input, mic_input, direct_path_input,
                 model_input, language_input, device_input, compute_input],
         outputs=[
+            progress_bar,
             text_out, detected_out, segments_out, console_out,
             srt_preview, vtt_preview, ass_preview, tsv_preview,
             srt_file, vtt_file, ass_file, tsv_file,
