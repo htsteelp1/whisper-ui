@@ -12,6 +12,7 @@ def get_model(model_name, device, compute_type):
         print(f"Loading model '{model_name}' on {device} ({compute_type})...")
         try:
             loaded_models[key] = WhisperModel(model_name, device=device, compute_type=compute_type)
+            print(f"Model '{model_name}' loaded successfully.")
         except Exception as e:
             if device == "cuda":
                 print(f"CUDA failed ({e}), falling back to CPU int8...")
