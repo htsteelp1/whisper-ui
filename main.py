@@ -1,46 +1,24 @@
 import gradio as gr
-import whisper
+import shutil
+import tempfile
+import os
+from faster_whisper import WhisperModel
 
 loaded_models = {}
 
-def get_model(model_name):
-    if model_name not in loaded_models:
-        loaded_models[model_name] = whisper.load_model(model_name)
-    return loaded_models[model_name]
-
-def transcribe(audio_path, model_name, language):
-    if audio_path is None:
-        return "No audio provided.", "", ""
-
-    model = get_model(model_name)
-
-    options = {}
-    if language != "Auto-detect":
-        options["language"] = language
-
-    result = model.transcribe(audio_path, **options)
-
-    full_text = result["text"].strip()
-    detected = result.get("language", "unknown").upper()
-
-    # Build timestamped transcript
-    segments_text = ""
-    for seg in result.get("segments", []):
-        start = seg["start"]
-        end = seg["end"]
-        text = seg["text"].strip()
-        m_s, s_s = divmod(start, 60)
-        m_e, s_e = divmod(end, 60)
-        segments_text += f"[{int(m_s):02d}:{s_s:04.1f} → {int(m_e):02d}:{s_e:04.1f}]  {text}\n"
-
-    return full_text, detected, segments_text.strip()
-
-
-LANGUAGES = [
-    "Auto-detect", "English", "Spanish", "French", "German",
-    "Italian", "Portuguese", "Dutch", "Russian", "Chinese",
-    "Japanese", "Korean", "Arabic", "Hindi", "Turkish",
-]
+def get_model(model_name, device, compute_type):
+    key = (model_name, device, compute_type)
+    if key not in loaded_models:
+        print(f"Loading model '{model_name}' on {device} ({compute_type})...")
+        try:
+            loaded_models[key] = WhisperModel(model_name, device=device, compute_type=compute_type)
+        except Exception as e:
+            if device == "cuda":
+                print(f"CUDA failed ({e}), falling back to CPU int8...")
+                loaded_models[key] = WhisperModel(model_name, device="cpu", compute_type="int8")
+            else:
+                raise
+    return loaded_models[key]
 
 LANGUAGE_MAP = {
     "Auto-detect": None, "English": "en", "Spanish": "es",
@@ -50,37 +28,110 @@ LANGUAGE_MAP = {
     "Arabic": "ar", "Hindi": "hi", "Turkish": "tr",
 }
 
-def run(audio, model_name, language_label):
-    lang_code = LANGUAGE_MAP.get(language_label, None)
-    text, detected, segments = transcribe(audio, model_name, lang_code)
-    return text, f"Detected: {detected}", segments
+def run(audio, direct_path, model_name, language_label, device, compute_type):
+    # Prefer direct path (instant, no upload) over uploaded file
+    if direct_path and direct_path.strip():
+        file_path = direct_path.strip()
+        if not os.path.exists(file_path):
+            return f"File not found: {file_path}", "", ""
+        use_temp = False
+    elif audio is not None:
+        # gr.File returns a dict with a 'path' or 'name' key
+        raw = audio if isinstance(audio, str) else (audio.get("path") or audio.get("name", ""))
+        ext = os.path.splitext(raw)[-1] or ".wav"
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            shutil.copy2(raw, tmp.name)
+            file_path = tmp.name
+        use_temp = True
+    else:
+        return "No audio provided. Upload a file or paste a file path.", "", ""
 
-with gr.Blocks(title="Whisper Transcription", theme=gr.themes.Monochrome()) as demo:
+    lang_code = LANGUAGE_MAP.get(language_label, None)
+
+    def do_transcribe(dev, ctype):
+        model = get_model(model_name, dev, ctype)
+        segments_gen, info = model.transcribe(
+            file_path,
+            language=lang_code,
+            beam_size=5,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=500),
+        )
+        full_text = ""
+        segments_text = ""
+        for seg in segments_gen:
+            full_text += seg.text + " "
+            m_s, s_s = divmod(seg.start, 60)
+            m_e, s_e = divmod(seg.end, 60)
+            segments_text += f"[{int(m_s):02d}:{s_s:04.1f} \u2192 {int(m_e):02d}:{s_e:04.1f}]  {seg.text.strip()}\n"
+        return full_text.strip(), info.language.upper(), segments_text.strip()
+
+    try:
+        try:
+            full_text, detected, segments_text = do_transcribe(device, compute_type)
+        except RuntimeError as cuda_err:
+            if "cuda" in device.lower() or "cublas" in str(cuda_err).lower() or "cuda" in str(cuda_err).lower():
+                print(f"[WARNING] CUDA failed ({cuda_err}). Retrying on CPU with int8...")
+                full_text, detected, segments_text = do_transcribe("cpu", "int8")
+                detected += " (CPU fallback — install CUDA 12 for GPU speed)"
+            else:
+                raise
+
+        return full_text, f"Detected: {detected}", segments_text
+
+    finally:
+        if use_temp:
+            os.unlink(file_path)
+
+
+
+with gr.Blocks(title="Faster Whisper Transcription") as demo:
     gr.Markdown(
         """
-        # 🎙 Whisper — Local Transcription
-        **100% offline. Nothing leaves your machine.**
+        # ⚡ Faster Whisper — Local Transcription
+        **GPU-accelerated. ~4x faster than standard Whisper. 100% offline.**
         """
     )
 
     with gr.Row():
         with gr.Column(scale=1):
-            audio_input = gr.Audio(
-                label="Audio / Video File",
-                type="filepath",
-                sources=["upload", "microphone"],
+            audio_input = gr.File(
+                label="Upload Audio / Video File",
+                file_types=["audio", "video", ".mp3", ".wav", ".m4a", ".ogg", ".flac", ".webm", ".mkv", ".mp4"],
             )
-            model_input = gr.Dropdown(
-                choices=["tiny", "base", "small", "medium", "large"],
-                value="base",
-                label="Model",
-                info="Larger = more accurate but slower",
+            direct_path_input = gr.Textbox(
+                label="Or paste a file path (instant — no upload needed)",
+                placeholder=r"e.g. C:\Users\Henry\Music\lecture.wav",
+                info="If filled, this takes priority over the upload above.",
             )
+
+            with gr.Row():
+                model_input = gr.Dropdown(
+                    choices=["tiny", "base", "small", "medium", "large-v2", "large-v3"],
+                    value="base",
+                    label="Model",
+                    info="Larger = more accurate, slower",
+                )
+                device_input = gr.Dropdown(
+                    choices=["cuda", "cpu"],
+                    value="cuda",
+                    label="Device",
+                    info="Use cuda for NVIDIA GPU",
+                )
+
+            compute_input = gr.Dropdown(
+                choices=["float16", "int8_float16", "int8"],
+                value="float16",
+                label="Compute Type",
+                info="float16 = fastest on GPU · int8 = less VRAM · int8 on CPU",
+            )
+
             language_input = gr.Dropdown(
-                choices=LANGUAGES,
+                choices=list(LANGUAGE_MAP.keys()),
                 value="Auto-detect",
                 label="Language",
             )
+
             submit_btn = gr.Button("Transcribe →", variant="primary")
 
         with gr.Column(scale=2):
@@ -88,31 +139,34 @@ with gr.Blocks(title="Whisper Transcription", theme=gr.themes.Monochrome()) as d
             text_out = gr.Textbox(
                 label="Transcription",
                 lines=12,
-                show_copy_button=True,
                 placeholder="Your transcript will appear here…",
             )
             segments_out = gr.Textbox(
                 label="Timestamped Segments",
                 lines=12,
-                show_copy_button=True,
                 placeholder="Segments with timestamps will appear here…",
             )
 
     submit_btn.click(
         fn=run,
-        inputs=[audio_input, model_input, language_input],
+        inputs=[audio_input, direct_path_input, model_input, language_input, device_input, compute_input],
         outputs=[text_out, detected_out, segments_out],
     )
 
     gr.Markdown(
         """
         ---
+        **Compute type guide:**
+        - `float16` — fastest, recommended for most NVIDIA GPUs
+        - `int8_float16` — slightly slower but uses less VRAM
+        - `int8` — best for CPU or low VRAM GPUs
+
         **Tips:**
-        - First run downloads the model (~75MB for `base`) — cached after that
-        - Use `tiny` or `base` for speed, `large` for best accuracy
-        - You can also record directly from your microphone
+        - If you get a CUDA error, switch Device to `cpu` and Compute Type to `int8`
+        - VAD filter is enabled — silent sections are automatically skipped for speed
+        - Models are cached in memory after first load
         """
     )
 
 if __name__ == "__main__":
-    demo.launch()
+    demo.launch(server_name="0.0.0.0", theme=gr.themes.Monochrome())
